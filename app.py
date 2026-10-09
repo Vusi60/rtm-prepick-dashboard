@@ -57,14 +57,14 @@ def load_and_merge_data(rtm_input, soh_input, tcs_input):
     rtm_df['Seller_Name_Clean'] = rtm_df['Seller Name'].fillna(rtm_df['Supplier Name'])
     rtm_df['Booking_Date_Parsed'] = pd.to_datetime(rtm_df['Booking Date'], errors='coerce')
     
-    # Safe cast Seller IDs to strings to ensure matching
+    # Safe cast Seller IDs to strings
     soh_df['Seller ID'] = soh_df['Seller ID'].astype(str).str.replace(r'\.0$', '', regex=True).str.strip()
     if tcs_df is not None:
         tcs_df['Seller ID'] = tcs_df['Seller ID'].astype(str).str.replace(r'\.0$', '', regex=True).str.strip()
 
     # 3. Merge RTM & SOH
     rtm_clean = rtm_df[['Facility', 'Courier Flag', 'Booking Date', 'Booking_Date_Parsed', 'Booking Nbr', 'LPN', 'OBI', 'Seller_Name_Clean', 'Pack QTY', 'Current Location']]
-    soh_dedup = soh_df[['LPN', 'Location Area', 'Location Barcode', 'Qty', 'LPN Status', 'Desc']].drop_duplicates(subset=['LPN'])
+    soh_dedup = soh_df[['LPN', 'Location Area', 'Location Barcode', 'Qty', 'LPN Status', 'Desc', 'Seller ID']].drop_duplicates(subset=['LPN'])
 
     merged_df = pd.merge(rtm_clean, soh_dedup, on='LPN', how='left')
 
@@ -117,7 +117,6 @@ elif horizon_option == "Custom Select":
 # --- DYNAMIC TFS INJECTION BASED ON HORIZON ---
 filtered_df = merged_data.copy()
 
-# Add TFS scheduled pickups to the workload if TCS is uploaded
 if tcs_raw_df is not None and len(selected_dates) > 0:
     tfs_records_list = []
     
@@ -128,13 +127,11 @@ if tcs_raw_df is not None and len(selected_dates) > 0:
         
         jhb_sellers, cpt_sellers = [], []
         
-        # Pull matching sellers for this day from TCS schedule
         if 'JHB' in tcs_raw_df.columns:
             jhb_sellers = tcs_raw_df[tcs_raw_df['JHB'].astype(str).str.strip().str.title() == day_of_week]['Seller ID'].unique()
         if 'CPT' in tcs_raw_df.columns:
             cpt_sellers = tcs_raw_df[tcs_raw_df['CPT'].astype(str).str.strip().str.title() == day_of_week]['Seller ID'].unique()
             
-        # Get live stock from SOH for these sellers
         tfs_jhb_soh = soh_raw_df[(soh_raw_df['Facility'] == 'JHB') & (soh_raw_df['Seller ID'].isin(jhb_sellers))]
         tfs_cpt_soh = soh_raw_df[(soh_raw_df['Facility'] == 'CPT') & (soh_raw_df['Seller ID'].isin(cpt_sellers))]
         tfs_soh = pd.concat([tfs_jhb_soh, tfs_cpt_soh])
@@ -148,6 +145,7 @@ if tcs_raw_df is not None and len(selected_dates) > 0:
                 'Booking Nbr': 'TFS_' + tfs_soh['Seller ID'].astype(str),
                 'LPN': tfs_soh['LPB Nbr'].astype(str).str.strip().str.upper(),
                 'OBI': tfs_soh['OBI'],
+                'Seller ID': tfs_soh['Seller ID'],
                 'Seller_Name_Clean': tfs_soh['Seller Name'],
                 'Pack QTY': tfs_soh['Qty'],
                 'Current Location': tfs_soh['Location Barcode'],
@@ -161,11 +159,8 @@ if tcs_raw_df is not None and len(selected_dates) > 0:
             
     if len(tfs_records_list) > 0:
         all_tfs = pd.concat(tfs_records_list, ignore_index=True)
-        
-        # De-duplicate: If LPN is already requested in RTM, drop it from TFS
         all_tfs = all_tfs[~all_tfs['LPN'].isin(filtered_df['LPN'])]
         
-        # Apply Status Logic
         picked_areas = ['MCSS', 'MCSP', 'MCSR', 'CCSP', 'MCSD', 'SC', 'CC', 'MCSF']
         all_tfs['Prepick_Status'] = all_tfs['Location Area'].apply(
             lambda x: 'Missing from SOH' if pd.isna(x) else ('Picked' if str(x).strip().upper() in picked_areas else 'Outstanding')
@@ -178,8 +173,6 @@ if tcs_raw_df is not None and len(selected_dates) > 0:
             return 'N/A'
             
         all_tfs['Location Zone'] = all_tfs.apply(extract_zone, axis=1)
-        
-        # Combine RTM and generated TFS stock list
         filtered_df = pd.concat([filtered_df, all_tfs], ignore_index=True)
 
 # --- ADDITIONAL FILTERS ---
@@ -201,7 +194,6 @@ if selected_dates: filtered_df = filtered_df[filtered_df['Booking Date'].isin(se
 if search_query:
     q = search_query.strip().upper()
     filtered_df = filtered_df[filtered_df['Booking Nbr'].astype(str).str.upper().str.contains(q) | filtered_df['LPN'].astype(str).str.upper().str.contains(q)]
-
 
 # --- INTELLIGENT ALERTS ---
 total_lpns = len(filtered_df)
@@ -328,7 +320,7 @@ with tab2:
         else:
             st.success("✅ No outstanding RTCR stock!")
 
-# TAB 3: GENERATED PREPICK WORKLIST
+# TAB 3: GENERATED PREPICK WORKLIST (WITH SELLER ID & LOCATION AREA)
 with tab3:
     st.markdown("#### 🖨️ Master Prepick Action List")
     st.caption("Sorted intelligently by Location Area and Barcode to create an efficient walking path for pickers.")
@@ -342,8 +334,8 @@ with tab3:
         worklist_sorted = worklist_df.sort_values(by=['Location Area', 'Location Barcode', 'Booking Date'])
         
         display_worklist = worklist_sorted[[
-            'Location Area', 'Location Barcode', 'LPN', 'Desc', 'Pack QTY', 'Booking Date', 'Booking Nbr', 'Courier Flag'
-        ]].rename(columns={'Desc': 'Item Description'})
+            'Location Area', 'Location Barcode', 'LPN', 'Seller ID', 'Seller_Name_Clean', 'Desc', 'Pack QTY', 'Booking Date', 'Booking Nbr', 'Courier Flag'
+        ]].rename(columns={'Desc': 'Item Description', 'Seller_Name_Clean': 'Seller Name'})
         
         st.dataframe(display_worklist, use_container_width=True, hide_index=True)
     else:
@@ -353,14 +345,14 @@ with tab3:
 # TAB 4: DETAIL LIST
 with tab4:
     st.markdown("#### Individual LPN Detail List")
-    st.dataframe(filtered_df[['Facility', 'Courier Flag', 'Booking Date', 'Booking Nbr', 'Seller_Name_Clean', 'OBI', 'LPN', 'Prepick_Status', 'Location Area', 'Location Zone', 'Location Barcode', 'Pack QTY']], use_container_width=True, hide_index=True)
+    st.dataframe(filtered_df[['Facility', 'Courier Flag', 'Booking Date', 'Booking Nbr', 'Seller ID', 'Seller_Name_Clean', 'OBI', 'LPN', 'Prepick_Status', 'Location Area', 'Location Zone', 'Location Barcode', 'Pack QTY']], use_container_width=True, hide_index=True)
 
 # TAB 5: EXCEPTIONS
 with tab5:
     st.markdown("#### Missing LPN Action List")
     missing_df = filtered_df[filtered_df['Prepick_Status'] == 'Missing from SOH']
     if len(missing_df) > 0:
-        st.dataframe(missing_df[['Facility', 'Courier Flag', 'Booking Date', 'Booking Nbr', 'Seller_Name_Clean', 'OBI', 'LPN', 'Pack QTY', 'Current Location']], use_container_width=True, hide_index=True)
+        st.dataframe(missing_df[['Facility', 'Courier Flag', 'Booking Date', 'Booking Nbr', 'Seller ID', 'Seller_Name_Clean', 'OBI', 'LPN', 'Pack QTY', 'Current Location']], use_container_width=True, hide_index=True)
     else:
         st.success("🎉 No missing LPNs found!")
 
