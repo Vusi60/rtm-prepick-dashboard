@@ -13,7 +13,7 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# Custom CSS
+# Custom CSS for KPI cards
 st.markdown("""
     <style>
     div[data-testid="metric-container"] {
@@ -34,22 +34,35 @@ st.sidebar.header("📁 Data Sources")
 
 rtm_file = st.sidebar.file_uploader("1. Upload RTM Dashboard (CSV)", type=['csv'])
 soh_file = st.sidebar.file_uploader("2. Upload DC SOH Export (CSV)", type=['csv'])
+tcs_file = st.sidebar.file_uploader("3. Upload TCS Schedule (Excel)", type=['xlsx', 'xls'])
 
 @st.cache_data
-def load_and_merge_data(rtm_input, soh_input):
+def load_and_merge_data(rtm_input, soh_input, tcs_input):
+    # 1. Load Data with Local Fallbacks
     if rtm_input is not None: rtm_df = pd.read_csv(rtm_input)
     elif os.path.exists('rtm.csv'): rtm_df = pd.read_csv('rtm.csv')
-    else: return None
+    else: return None, None, None
 
     if soh_input is not None: soh_df = pd.read_csv(soh_input)
     elif os.path.exists('soh.csv'): soh_df = pd.read_csv('soh.csv')
-    else: return None
+    else: return None, None, None
+    
+    tcs_df = None
+    if tcs_input is not None: tcs_df = pd.read_excel(tcs_input)
+    elif os.path.exists('tcs.xlsx'): tcs_df = pd.read_excel('tcs.xlsx')
 
+    # 2. Standardize Keys
     rtm_df['LPN'] = rtm_df['OBLPN'].astype(str).str.strip().str.upper()
     soh_df['LPN'] = soh_df['LPB Nbr'].astype(str).str.strip().str.upper()
     rtm_df['Seller_Name_Clean'] = rtm_df['Seller Name'].fillna(rtm_df['Supplier Name'])
     rtm_df['Booking_Date_Parsed'] = pd.to_datetime(rtm_df['Booking Date'], errors='coerce')
+    
+    # Safe cast Seller IDs to strings to ensure matching
+    soh_df['Seller ID'] = soh_df['Seller ID'].astype(str).str.replace(r'\.0$', '', regex=True).str.strip()
+    if tcs_df is not None:
+        tcs_df['Seller ID'] = tcs_df['Seller ID'].astype(str).str.replace(r'\.0$', '', regex=True).str.strip()
 
+    # 3. Merge RTM & SOH
     rtm_clean = rtm_df[['Facility', 'Courier Flag', 'Booking Date', 'Booking_Date_Parsed', 'Booking Nbr', 'LPN', 'OBI', 'Seller_Name_Clean', 'Pack QTY', 'Current Location']]
     soh_dedup = soh_df[['LPN', 'Location Area', 'Location Barcode', 'Qty', 'LPN Status', 'Desc']].drop_duplicates(subset=['LPN'])
 
@@ -74,24 +87,15 @@ def load_and_merge_data(rtm_input, soh_input):
     merged_df['Location Zone'] = merged_df.apply(extract_zone, axis=1)
     merged_df['Courier Flag'] = merged_df['Courier Flag'].fillna('Unassigned')
     
-    return merged_df
+    return merged_df, soh_df, tcs_df
 
-merged_data = load_and_merge_data(rtm_file, soh_file)
+merged_data, soh_raw_df, tcs_raw_df = load_and_merge_data(rtm_file, soh_file, tcs_file)
 
 if merged_data is None:
-    st.info("👈 **Please upload your CSV files in the sidebar to begin.**")
+    st.info("👈 **Please upload your RTM & SOH CSV files in the sidebar to begin.**")
     st.stop()
 
 # --- SIDEBAR: FILTERS & HORIZON ---
-st.sidebar.markdown("---")
-st.sidebar.header("🎯 Operational Filters")
-
-available_facilities = sorted(merged_data['Facility'].dropna().unique())
-selected_facilities = st.sidebar.multiselect("Warehouse Facility", options=available_facilities, default=available_facilities[:1] if 'JHB' in available_facilities else available_facilities)
-
-available_couriers = sorted(merged_data['Courier Flag'].dropna().unique())
-selected_couriers = st.sidebar.multiselect("Courier / Dispatch Truck", options=available_couriers, placeholder="All Couriers (Leave blank)")
-
 st.sidebar.markdown("---")
 st.sidebar.header("🗓️ Time Horizon")
 
@@ -110,17 +114,94 @@ elif horizon_option == "All Dates": selected_dates = unique_booking_dates
 elif horizon_option == "Custom Select":
     selected_dates = st.sidebar.multiselect("Select Dates:", options=unique_booking_dates, default=unique_booking_dates[:1] if unique_booking_dates else [])
 
-search_query = st.sidebar.text_input("Search Booking Nbr or LPN", placeholder="e.g. TALB...")
-
-# --- APPLY ALL FILTERS ---
+# --- DYNAMIC TFS INJECTION BASED ON HORIZON ---
 filtered_df = merged_data.copy()
 
+# Add TFS scheduled pickups to the workload if TCS is uploaded
+if tcs_raw_df is not None and len(selected_dates) > 0:
+    tfs_records_list = []
+    
+    for date_str in selected_dates:
+        date_obj = pd.to_datetime(date_str, errors='coerce')
+        if pd.isna(date_obj): continue
+        day_of_week = date_obj.strftime('%A')
+        
+        jhb_sellers, cpt_sellers = [], []
+        
+        # Pull matching sellers for this day from TCS schedule
+        if 'JHB' in tcs_raw_df.columns:
+            jhb_sellers = tcs_raw_df[tcs_raw_df['JHB'].astype(str).str.strip().str.title() == day_of_week]['Seller ID'].unique()
+        if 'CPT' in tcs_raw_df.columns:
+            cpt_sellers = tcs_raw_df[tcs_raw_df['CPT'].astype(str).str.strip().str.title() == day_of_week]['Seller ID'].unique()
+            
+        # Get live stock from SOH for these sellers
+        tfs_jhb_soh = soh_raw_df[(soh_raw_df['Facility'] == 'JHB') & (soh_raw_df['Seller ID'].isin(jhb_sellers))]
+        tfs_cpt_soh = soh_raw_df[(soh_raw_df['Facility'] == 'CPT') & (soh_raw_df['Seller ID'].isin(cpt_sellers))]
+        tfs_soh = pd.concat([tfs_jhb_soh, tfs_cpt_soh])
+        
+        if not tfs_soh.empty:
+            tfs_records = pd.DataFrame({
+                'Facility': tfs_soh['Facility'],
+                'Courier Flag': 'TFS Scheduled',
+                'Booking Date': date_str,
+                'Booking_Date_Parsed': date_obj,
+                'Booking Nbr': 'TFS_' + tfs_soh['Seller ID'].astype(str),
+                'LPN': tfs_soh['LPB Nbr'].astype(str).str.strip().str.upper(),
+                'OBI': tfs_soh['OBI'],
+                'Seller_Name_Clean': tfs_soh['Seller Name'],
+                'Pack QTY': tfs_soh['Qty'],
+                'Current Location': tfs_soh['Location Barcode'],
+                'Location Area': tfs_soh['Location Area'],
+                'Location Barcode': tfs_soh['Location Barcode'],
+                'Qty': tfs_soh['Qty'],
+                'LPN Status': tfs_soh['LPN Status'],
+                'Desc': tfs_soh['Desc']
+            })
+            tfs_records_list.append(tfs_records)
+            
+    if len(tfs_records_list) > 0:
+        all_tfs = pd.concat(tfs_records_list, ignore_index=True)
+        
+        # De-duplicate: If LPN is already requested in RTM, drop it from TFS
+        all_tfs = all_tfs[~all_tfs['LPN'].isin(filtered_df['LPN'])]
+        
+        # Apply Status Logic
+        picked_areas = ['MCSS', 'MCSP', 'MCSR', 'CCSP', 'MCSD', 'SC', 'CC', 'MCSF']
+        all_tfs['Prepick_Status'] = all_tfs['Location Area'].apply(
+            lambda x: 'Missing from SOH' if pd.isna(x) else ('Picked' if str(x).strip().upper() in picked_areas else 'Outstanding')
+        )
+        
+        def extract_zone(row):
+            barcode = str(row.get('Location Barcode', '')).strip().upper()
+            if row.get('Location Area') == 'RTCR' and barcode.startswith('RTCR') and len(barcode) >= 6:
+                return barcode[4:6]
+            return 'N/A'
+            
+        all_tfs['Location Zone'] = all_tfs.apply(extract_zone, axis=1)
+        
+        # Combine RTM and generated TFS stock list
+        filtered_df = pd.concat([filtered_df, all_tfs], ignore_index=True)
+
+# --- ADDITIONAL FILTERS ---
+st.sidebar.markdown("---")
+st.sidebar.header("🎯 Operational Filters")
+
+available_facilities = sorted(filtered_df['Facility'].dropna().unique())
+selected_facilities = st.sidebar.multiselect("Warehouse Facility", options=available_facilities, default=available_facilities[:1] if 'JHB' in available_facilities else available_facilities)
+
+available_couriers = sorted(filtered_df['Courier Flag'].dropna().unique())
+selected_couriers = st.sidebar.multiselect("Courier / Dispatch Truck", options=available_couriers, placeholder="All Couriers (Leave blank)")
+
+search_query = st.sidebar.text_input("Search Booking Nbr or LPN", placeholder="e.g. TALB...")
+
+# Filter Application
 if selected_facilities: filtered_df = filtered_df[filtered_df['Facility'].isin(selected_facilities)]
 if selected_couriers: filtered_df = filtered_df[filtered_df['Courier Flag'].isin(selected_couriers)]
 if selected_dates: filtered_df = filtered_df[filtered_df['Booking Date'].isin(selected_dates)]
 if search_query:
     q = search_query.strip().upper()
     filtered_df = filtered_df[filtered_df['Booking Nbr'].astype(str).str.upper().str.contains(q) | filtered_df['LPN'].astype(str).str.upper().str.contains(q)]
+
 
 # --- INTELLIGENT ALERTS ---
 total_lpns = len(filtered_df)
@@ -173,7 +254,7 @@ st.divider()
 
 # --- DATA TABS ---
 tab1, tab2, tab3, tab4, tab5 = st.tabs([
-    "📋 Booking Summary", 
+    "📋 Booking & TFS Summary", 
     "📍 Physical Workload", 
     "🖨️ Generated Prepick Worklist", 
     "🔍 Full Detail", 
@@ -247,19 +328,17 @@ with tab2:
         else:
             st.success("✅ No outstanding RTCR stock!")
 
-# TAB 3: GENERATED PREPICK WORKLIST (NEW)
+# TAB 3: GENERATED PREPICK WORKLIST
 with tab3:
     st.markdown("#### 🖨️ Master Prepick Action List")
     st.caption("Sorted intelligently by Location Area and Barcode to create an efficient walking path for pickers.")
     
-    # Isolate outstanding stock with known locations
     worklist_df = filtered_df[
         (filtered_df['Prepick_Status'] == 'Outstanding') & 
         (filtered_df['Location Barcode'].notna())
     ].copy()
     
     if len(worklist_df) > 0:
-        # Sort for walking path logic
         worklist_sorted = worklist_df.sort_values(by=['Location Area', 'Location Barcode', 'Booking Date'])
         
         display_worklist = worklist_sorted[[
@@ -289,7 +368,6 @@ with tab5:
 st.sidebar.markdown("---")
 st.sidebar.header("📥 Export & Share")
 
-# Button 1: Full Report Export
 def get_excel():
     output = BytesIO()
     with pd.ExcelWriter(output, engine='openpyxl') as writer:
@@ -307,7 +385,6 @@ st.sidebar.download_button(
     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 )
 
-# Button 2: Quick Picklist CSV for floor workers
 if len(display_worklist) > 0:
     st.sidebar.download_button(
         label="🖨️ Download Prepick Worklist (CSV)",
